@@ -1,0 +1,19 @@
+__pycache__/
+*.py[cod]
+*.egg-info/
+.pytest_cache/
+.venv/
+venv/
+.env
+
+# macOS
+.DS_Store
+
+# Hugging Face cache (point HF_HOME elsewhere; don't commit weights)
+hf_cache/
+
+# Benchmark outputs (rerun to reproduce)
+docs/figures/*.png
+!docs/figures/.gitkeep
+results/
+*.csv
