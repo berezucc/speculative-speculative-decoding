@@ -20,7 +20,15 @@ def test_uniform_fan_out_spreads_evenly():
 def test_cache_basic():
     cache = SpeculationCache()
     outcome = Outcome(k_accepted=2, bonus=42)
-    cache.put(outcome, CachedSpeculation(tokens=[1, 2, 3, 4], draft_probs=torch.zeros(4, 10), kv_after=None))
+    cache.put(
+        outcome,
+        CachedSpeculation(
+            tokens=[1, 2, 3, 4],
+            draft_probs=torch.zeros(5, 10),
+            raw_logits=torch.zeros(5, 10),
+            snapshots=[],
+        ),
+    )
     assert outcome in cache
     assert len(cache) == 1
     assert cache.get(outcome).tokens == [1, 2, 3, 4]

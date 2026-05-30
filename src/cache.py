@@ -17,15 +17,16 @@ class Outcome:
 
 @dataclass
 class CachedSpeculation:
-    """K speculated tokens + the draft probabilities used to generate them.
+    """K speculated tokens with everything the next round needs to verify them.
 
-    The probabilities are kept so the next round's acceptance step can compute
-    α = min(1, p_target / p_draft) without re-running the draft.
+    Stores both the biased draft probs (used in α = min(1, p_target/p_draft)) and
+    the raw logits (used to predict outcomes for the round after that).
     """
 
     tokens: list[int]
-    draft_probs: torch.Tensor  # (K, V)
-    kv_after: object           # draft KV covering [outcome prefix + tokens[:-1]]
+    draft_probs: torch.Tensor   # (K+1, V) biased — for verification
+    raw_logits: torch.Tensor    # (K+1, V) — for next round's outcome prediction
+    snapshots: list             # K+1 KV snapshots covering positions 0..K of the cached spec
 
 
 @dataclass

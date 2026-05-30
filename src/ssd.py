@@ -14,7 +14,7 @@ import torch
 from .cache import CachedSpeculation, Outcome, SpeculationCache
 from .models import LM, truncate_kv
 from .outcomes import FanOutFn, predict_outcomes, uniform_fan_out
-from .sampling import logits_to_probs, sample, sample_residual
+from .sampling import logits_to_probs, sample, sample_residual, saguaro_probs
 
 
 @dataclass
@@ -40,36 +40,51 @@ def _prefill(lm: LM, ids: torch.Tensor):
     return lm.forward(ids[:, :-1]).past_key_values
 
 
-def _draft_K_from(draft: LM, kv_init, first_token: int, K: int, temperature: float):
+def _draft_K_from(
+    draft: LM,
+    kv_init,
+    first_token: int,
+    K: int,
+    temperature: float,
+    fan_out: list[int] | None = None,
+    saguaro_c: float = 1.0,
+):
     """K+1 draft passes from `kv_init`, starting by feeding `first_token`.
 
-    If `kv_init` covers prefix P, returns:
-        spec_tokens   (K,)        spec[k] sampled from logits at position P+first_token+spec[:k-1]
-        probs         (K+1, V)    probs[k] = draft distribution at position P+first_token+spec[:k]
-                                  (the (K+1)th row predicts the bonus token for full-accept)
-        snapshots     (K+1)       snap[k] = deep-copied KV covering P + first_token + spec[:k]
+    Returns:
+        spec_tokens   (K,)         spec[k] sampled from biased distribution at position k
+        biased_probs  (K+1, V)     distribution used for sampling (and for α in verification)
+        raw_logits    (K+1, V)     unbiased logits (used for outcome prediction)
+        snapshots     (K+1)        snap[k] = KV covering (kv_init prefix) + first_token + spec[:k]
     """
-    snapshots = []
+    snapshots: list = []
     spec_tokens: list[torch.Tensor] = []
-    probs: list[torch.Tensor] = []
+    biased: list[torch.Tensor] = []
+    raw: list[torch.Tensor] = []
 
     kv = kv_init
     prev = torch.tensor([[first_token]], device=draft.device)
-    for _ in range(K):
+    for j in range(K):
         out = draft.forward(prev, past_kv=kv)
         kv = out.past_key_values
         snapshots.append(copy.deepcopy(kv))
-        p = logits_to_probs(out.logits[0, -1, :], temperature)
+        z = out.logits[0, -1, :]
+        raw.append(z)
+        F = fan_out[j] if fan_out is not None else 0
+        p = saguaro_probs(z, temperature, F, saguaro_c)
         t = sample(p)
+        biased.append(p)
         spec_tokens.append(t)
-        probs.append(p)
         prev = t.view(1, 1)
 
     out = draft.forward(prev, past_kv=kv)
     snapshots.append(copy.deepcopy(out.past_key_values))
-    probs.append(logits_to_probs(out.logits[0, -1, :], temperature))
+    z = out.logits[0, -1, :]
+    raw.append(z)
+    F_K = fan_out[K] if fan_out is not None else 0
+    biased.append(saguaro_probs(z, temperature, F_K, saguaro_c))
 
-    return torch.stack(spec_tokens), torch.stack(probs), snapshots
+    return torch.stack(spec_tokens), torch.stack(biased), torch.stack(raw), snapshots
 
 
 def _build_cache(
@@ -78,20 +93,29 @@ def _build_cache(
     snapshots: list,
     k: int,
     temperature: float,
+    fan_out: list[int] | None,
+    saguaro_c: float,
 ) -> SpeculationCache:
-    """For each predicted outcome, pre-draft K next-round spec tokens."""
     cache = SpeculationCache()
     for outcome in outcomes:
-        toks, probs, snaps = _draft_K_from(
-            draft, copy.deepcopy(snapshots[outcome.k_accepted]), outcome.bonus, k, temperature
+        toks, biased, raw, snaps = _draft_K_from(
+            draft,
+            copy.deepcopy(snapshots[outcome.k_accepted]),
+            outcome.bonus,
+            k,
+            temperature,
+            fan_out=fan_out,
+            saguaro_c=saguaro_c,
         )
         cache.put(
             outcome,
-            CachedSpeculation(tokens=toks.tolist(), draft_probs=probs, kv_after=snaps[-1]),
+            CachedSpeculation(
+                tokens=toks.tolist(),
+                draft_probs=biased,
+                raw_logits=raw,
+                snapshots=snaps,
+            ),
         )
-        # Attach snapshots as an attribute for next-round reuse (kept off the dataclass
-        # to avoid bloating the cache size if not used).
-        cache.entries[outcome].snapshots = snaps  # type: ignore[attr-defined]
     return cache
 
 
@@ -141,14 +165,19 @@ def ssd_decode(
     budget: int = 8,
     temperature: float = 0.0,
     fan_out_fn: FanOutFn | None = None,
+    saguaro_c: float = 1.0,
 ) -> tuple[list[int], SSDStats]:
-    """SSD with pluggable fan-out and synchronous-draft fallback on cache miss.
+    """SSD with pluggable fan-out, optional Saguaro sampling, sync-draft fallback.
 
-    `fan_out_fn(K, B) -> list[int]` returns per-position cache budgets summing to B.
-    Defaults to uniform allocation. See `outcomes.geometric_fan_out` for §4.1.
+    Args:
+        fan_out_fn:  callable(K, B) → list of K+1 per-position cache budgets.
+                     Defaults to uniform. See `outcomes.geometric_fan_out` for §4.1.
+        saguaro_c:   Saguaro downweight C ∈ [0, 1]. 1.0 disables (vanilla sampling).
+                     Lower values increase cache hit rate at the cost of acceptance.
     """
     if fan_out_fn is None:
         fan_out_fn = uniform_fan_out
+
     ids = verifier.tokenizer.encode(prompt, return_tensors="pt").to(verifier.device)
     L0 = ids.shape[1]
     current = ids.clone()
@@ -157,8 +186,11 @@ def ssd_decode(
     d_kv = _prefill(draft, ids)
     stats = SSDStats()
 
+    fan_out = fan_out_fn(k, budget)
     last = int(current[0, -1].item())
-    spec_tokens, spec_probs, snapshots = _draft_K_from(draft, d_kv, last, k, temperature)
+    spec_tokens, spec_probs, raw_logits, snapshots = _draft_K_from(
+        draft, d_kv, last, k, temperature, fan_out=fan_out, saguaro_c=saguaro_c
+    )
 
     while current.shape[1] - L0 < n_tokens:
         T = current.shape[1]
@@ -167,11 +199,10 @@ def ssd_decode(
             verifier, last, spec_tokens, spec_probs[:k], v_kv, temperature
         )
 
-        fan_out = fan_out_fn(k, budget)
         predicted = predict_outcomes(
-            [spec_probs[i] for i in range(k + 1)], spec_tokens.tolist(), fan_out
+            [raw_logits[i] for i in range(k + 1)], spec_tokens.tolist(), fan_out
         )
-        cache = _build_cache(draft, predicted, snapshots, k, temperature)
+        cache = _build_cache(draft, predicted, snapshots, k, temperature, fan_out, saguaro_c)
         stats.cache_sizes.append(len(cache))
 
         if accepted < k:
@@ -193,10 +224,12 @@ def ssd_decode(
             cached = cache.get(outcome)
             spec_tokens = torch.tensor(cached.tokens, device=draft.device)
             spec_probs = cached.draft_probs
-            snapshots = cached.snapshots  # type: ignore[attr-defined]
+            raw_logits = cached.raw_logits
+            snapshots = cached.snapshots
         else:
-            spec_tokens, spec_probs, snapshots = _draft_K_from(
-                draft, snapshots[accepted], last, k, temperature
+            spec_tokens, spec_probs, raw_logits, snapshots = _draft_K_from(
+                draft, snapshots[accepted], last, k, temperature,
+                fan_out=fan_out, saguaro_c=saguaro_c,
             )
 
     return current[0, L0 : L0 + n_tokens].tolist(), stats
