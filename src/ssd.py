@@ -13,7 +13,7 @@ import torch
 
 from .cache import CachedSpeculation, Outcome, SpeculationCache
 from .models import LM, truncate_kv
-from .outcomes import predict_outcomes, uniform_fan_out
+from .outcomes import FanOutFn, predict_outcomes, uniform_fan_out
 from .sampling import logits_to_probs, sample, sample_residual
 
 
@@ -140,8 +140,15 @@ def ssd_decode(
     k: int = 4,
     budget: int = 8,
     temperature: float = 0.0,
+    fan_out_fn: FanOutFn | None = None,
 ) -> tuple[list[int], SSDStats]:
-    """SSD with uniform fan-out and synchronous-draft fallback on cache miss."""
+    """SSD with pluggable fan-out and synchronous-draft fallback on cache miss.
+
+    `fan_out_fn(K, B) -> list[int]` returns per-position cache budgets summing to B.
+    Defaults to uniform allocation. See `outcomes.geometric_fan_out` for §4.1.
+    """
+    if fan_out_fn is None:
+        fan_out_fn = uniform_fan_out
     ids = verifier.tokenizer.encode(prompt, return_tensors="pt").to(verifier.device)
     L0 = ids.shape[1]
     current = ids.clone()
@@ -160,7 +167,7 @@ def ssd_decode(
             verifier, last, spec_tokens, spec_probs[:k], v_kv, temperature
         )
 
-        fan_out = uniform_fan_out(k, budget)
+        fan_out = fan_out_fn(k, budget)
         predicted = predict_outcomes(
             [spec_probs[i] for i in range(k + 1)], spec_tokens.tolist(), fan_out
         )
