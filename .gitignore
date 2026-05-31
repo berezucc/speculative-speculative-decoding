@@ -12,8 +12,6 @@ venv/
 # Hugging Face cache (point HF_HOME elsewhere; don't commit weights)
 hf_cache/
 
-# Benchmark outputs (rerun to reproduce)
-docs/figures/*.png
-!docs/figures/.gitkeep
+# Benchmark outputs — commit the reference figures + CSVs from `make bench`,
+# ignore everything else (logs, intermediate runs)
 results/
-*.csv
